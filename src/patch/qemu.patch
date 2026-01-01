@@ -1,0 +1,717 @@
+diff --git a/tests/qtest/arituzz/arituzz_fuzz.c b/tests/qtest/arituzz/arituzz_fuzz.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a5a054a7fa6195935307e83f105f315e1e703a1
+--- /dev/null
++++ b/tests/qtest/arituzz/arituzz_fuzz.c
+@@ -0,0 +1,701 @@
++/*
++ * Minimal AriTuzz harness for QEMU qtest fuzzing.
++ */
++
++#include "qemu/osdep.h"
++
++#include <inttypes.h>
++
++#include "hw/core/boards.h"
++#include "hw/core/cpu.h"
++#include "hw/core/qdev.h"
++#include "hw/mem/sparse-mem.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/pci_device.h"
++#include "system/memory.h"
++#include "tests/qtest/libqos/pci-pc.h"
++#include "tests/qtest/libqtest.h"
++
++#include "../fuzz/fuzz.h"
++#include "../fuzz/generic_fuzz_configs.h"
++#include "arituzz_qtest.h"
++
++#include <arituzz_fuzz.h>
++
++#define MAX_DMA_FILL_SIZE 0x10000
++#define MAX_TOTAL_DMA_SIZE 0x10000000
++
++static const generic_fuzz_config *active_config;
++static bool qtest_log_enabled;
++static bool avoid_double_fetches = true;
++static QTestState *qts_global;
++static GHashTable *fuzzable_memoryregions;
++static GPtrArray *fuzzable_pci_devices;
++static GArray *dma_regions;
++static GArray *dma_patterns;
++static int dma_pattern_index;
++static size_t dma_bytes_written;
++static MemoryRegion *sparse_mem_mr;
++static size_t mmio_region_count;
++static size_t pio_region_count;
++
++size_t LLVMFuzzerCustomMutator(uint8_t *data, size_t size, size_t max_size,
++                               unsigned int seed);
++
++struct get_io_cb_info {
++    size_t index;
++    bool found;
++    AriTuzzAddressRange result;
++};
++
++static bool ranges_overlap_u64(uint64_t addr1, uint64_t len1,
++                               uint64_t addr2, uint64_t len2)
++{
++    if (len1 == 0 || len2 == 0) {
++        return false;
++    }
++    return addr1 < addr2 + len2 && addr2 < addr1 + len1;
++}
++
++static void arituzz_usage(void)
++{
++    fprintf(stderr, "AriTuzz paths are pinned under /opt/src/projects/vmfuzz\n");
++    exit(1);
++}
++
++static size_t arituzz_byte_width(AriTuzzDataSize size, bool is_pio)
++{
++    switch (size) {
++    case ARITUZZ_WORD:
++        return 2;
++    case ARITUZZ_LONG:
++        return 4;
++    case ARITUZZ_QUAD:
++        return is_pio ? 4 : 8;
++    case ARITUZZ_SIZE_UNSPECIFIED:
++    case ARITUZZ_BYTE:
++    default:
++        return 1;
++    }
++}
++
++static void *pattern_alloc(AriTuzzPattern pattern, size_t len)
++{
++    uint8_t *buffer;
++    uint8_t sum = 0;
++
++    buffer = g_malloc(len);
++    for (size_t i = 0; i < len; i++) {
++        buffer[i] = pattern.data[i % pattern.len];
++        if ((i % pattern.len) == pattern.index) {
++            buffer[i] += sum;
++            sum += pattern.stride;
++        }
++    }
++    return buffer;
++}
++
++static int fuzz_memory_access_size(MemoryRegion *mr, unsigned len, hwaddr addr)
++{
++    unsigned access_size_max = mr->ops->valid.max_access_size;
++
++    if (access_size_max == 0) {
++        access_size_max = 4;
++    }
++    if (!mr->ops->impl.unaligned) {
++        unsigned align_size_max = addr & -addr;
++        if (align_size_max != 0 && align_size_max < access_size_max) {
++            access_size_max = align_size_max;
++        }
++    }
++    if (len > access_size_max) {
++        len = access_size_max;
++    }
++    return pow2floor(len);
++}
++
++void fuzz_dma_read_cb(size_t addr, size_t len, MemoryRegion *mr)
++{
++    AriTuzzAddressRange region;
++    bool double_fetch = false;
++
++    if (!qts_global || !dma_patterns || dma_patterns->len == 0) {
++        return;
++    }
++    if (len == 0 || dma_bytes_written + len > MAX_TOTAL_DMA_SIZE ||
++        (mr != current_machine->ram && mr != sparse_mem_mr)) {
++        return;
++    }
++
++    for (size_t i = 0;
++         i < dma_regions->len && (avoid_double_fetches || qtest_log_enabled);
++         i++) {
++        region = g_array_index(dma_regions, AriTuzzAddressRange, i);
++        if (ranges_overlap_u64(addr, len, region.addr, region.size)) {
++            double_fetch = true;
++            if (addr < region.addr && avoid_double_fetches) {
++                fuzz_dma_read_cb(addr, region.addr - addr, mr);
++            }
++            if (addr + len > region.addr + region.size && avoid_double_fetches) {
++                fuzz_dma_read_cb(region.addr + region.size,
++                                 addr + len - (region.addr + region.size), mr);
++            }
++            return;
++        }
++    }
++
++    len = MIN(len, MAX_DMA_FILL_SIZE);
++    region.addr = addr;
++    region.size = len;
++    g_array_append_val(dma_regions, region);
++
++    AriTuzzPattern pattern = g_array_index(dma_patterns, AriTuzzPattern,
++                                           dma_pattern_index);
++    void *buffer_base = pattern_alloc(pattern, region.size);
++    uint8_t *buffer = buffer_base;
++
++    while (len > 0) {
++        hwaddr chunk_len = len;
++        hwaddr offset_in_region;
++        MemoryRegion *translated_mr =
++            address_space_translate(first_cpu->as, addr, &offset_in_region,
++                                    &chunk_len, true, MEMTXATTRS_UNSPECIFIED);
++
++        if (!memory_region_is_ram(translated_mr)) {
++            chunk_len = fuzz_memory_access_size(translated_mr, chunk_len,
++                                                offset_in_region);
++        }
++
++        if (memory_region_is_ram(translated_mr) ||
++            memory_region_is_romd(translated_mr) ||
++            translated_mr == sparse_mem_mr) {
++            if (qtest_log_enabled) {
++                fprintf(stderr, "[DMA] ");
++                if (double_fetch) {
++                    fprintf(stderr, "[DOUBLE-FETCH] ");
++                }
++                fflush(stderr);
++            }
++            qtest_memwrite(qts_global, addr, buffer, chunk_len);
++            dma_bytes_written += chunk_len;
++        }
++
++        len -= chunk_len;
++        buffer += chunk_len;
++        addr += chunk_len;
++    }
++
++    g_free(buffer_base);
++    dma_pattern_index = (dma_pattern_index + 1) % dma_patterns->len;
++}
++
++static bool get_io_address_cb(Int128 start, Int128 size, const MemoryRegion *mr,
++                              hwaddr offset_in_region, void *opaque)
++{
++    struct get_io_cb_info *info = opaque;
++
++    (void)offset_in_region;
++    if (!g_hash_table_lookup(fuzzable_memoryregions, mr)) {
++        return false;
++    }
++    if (info->index == 0) {
++        info->result.addr = int128_get64(start);
++        info->result.size = int128_get64(size);
++        info->found = true;
++        return true;
++    }
++    info->index--;
++    return false;
++}
++
++static bool get_io_address(AriTuzzAddressRange *result, AddressSpace *as,
++                           uint8_t index, uint32_t offset)
++{
++    FlatView *view = as->current_map;
++    struct get_io_cb_info info = {};
++
++    g_assert(view);
++    info.index = index;
++    do {
++        flatview_for_each_range(view, get_io_address_cb, &info);
++    } while (info.index != index && !info.found);
++
++    *result = info.result;
++    if (result->size == 0) {
++        return false;
++    }
++
++    offset %= result->size;
++    result->addr += offset;
++    result->size -= offset;
++    return true;
++}
++
++static bool get_mmio_address(AriTuzzAddressRange *result, uint8_t index,
++                             uint32_t offset)
++{
++    if (mmio_region_count == 0) {
++        return false;
++    }
++    return get_io_address(result, &address_space_memory,
++                          index % mmio_region_count, offset);
++}
++
++static bool get_pio_address(AriTuzzAddressRange *result, uint8_t index,
++                            uint16_t offset)
++{
++    bool found;
++
++    if (pio_region_count == 0) {
++        return false;
++    }
++    found = get_io_address(result, &address_space_io, index % pio_region_count,
++                           offset);
++    return found && result->addr <= 0xFFFF;
++}
++
++static int locate_fuzz_memory_regions(Object *child, void *opaque)
++{
++    MemoryRegion *mr;
++
++    (void)opaque;
++    if (!object_dynamic_cast(child, TYPE_MEMORY_REGION)) {
++        return 0;
++    }
++
++    mr = MEMORY_REGION(child);
++    if (memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
++        memory_region_is_rom(mr)) {
++        return 0;
++    }
++
++    g_hash_table_insert(fuzzable_memoryregions, mr, (gpointer)true);
++    return 0;
++}
++
++static int locate_fuzz_objects(Object *child, void *opaque)
++{
++    GString *type_name;
++    GString *path_name;
++    char *pattern = opaque;
++
++    type_name = g_string_new(object_get_typename(child));
++    g_string_ascii_down(type_name);
++    if (g_pattern_match_simple(pattern, type_name->str)) {
++        object_child_foreach_recursive(child, locate_fuzz_memory_regions, NULL);
++        if (object_dynamic_cast(OBJECT(child), TYPE_PCI_DEVICE)) {
++            g_ptr_array_remove_fast(fuzzable_pci_devices, PCI_DEVICE(child));
++            g_ptr_array_add(fuzzable_pci_devices, PCI_DEVICE(child));
++        }
++    } else if (object_dynamic_cast(OBJECT(child), TYPE_MEMORY_REGION)) {
++        path_name = g_string_new(object_get_canonical_path_component(child));
++        g_string_ascii_down(path_name);
++        if (g_pattern_match_simple(pattern, path_name->str)) {
++            MemoryRegion *mr = MEMORY_REGION(child);
++
++            if (!memory_region_is_ram(mr) && !memory_region_is_ram_device(mr) &&
++                !memory_region_is_rom(mr)) {
++                g_hash_table_insert(fuzzable_memoryregions, mr, (gpointer)true);
++            }
++        }
++        g_string_free(path_name, true);
++    }
++    g_string_free(type_name, true);
++    return 0;
++}
++
++static void pci_enum(gpointer pcidev, gpointer bus)
++{
++    PCIDevice *dev = pcidev;
++    QPCIDevice *qdev;
++
++    qdev = qpci_device_find(bus, dev->devfn);
++    g_assert(qdev != NULL);
++    for (int i = 0; i < 6; i++) {
++        if (dev->io_regions[i].size) {
++            qpci_iomap(qdev, i, NULL);
++        }
++    }
++    qpci_device_enable(qdev);
++    g_free(qdev);
++}
++
++static uint8_t access_min_size(const MemoryRegion *mr)
++{
++    if (!mr->ops || mr->ops->valid.min_access_size == 0) {
++        return 1;
++    }
++    return mr->ops->valid.min_access_size;
++}
++
++static uint8_t access_max_size(const MemoryRegion *mr, bool is_pio)
++{
++    if (!mr->ops || mr->ops->valid.max_access_size == 0) {
++        return is_pio ? 4 : 8;
++    }
++    return mr->ops->valid.max_access_size;
++}
++
++static bool add_mmio_interface_cb(Int128 start, Int128 size,
++                                  const MemoryRegion *mr,
++                                  hwaddr offset_in_region, void *opaque)
++{
++    (void)offset_in_region;
++    (void)opaque;
++    if (!g_hash_table_lookup(fuzzable_memoryregions, mr)) {
++        return false;
++    }
++
++    add_interface(INTERFACE_TYPE_MMIO, int128_get64(start), int128_get64(size),
++                  mr->name ? mr->name : "mmio", access_min_size(mr),
++                  access_max_size(mr, false));
++    mmio_region_count++;
++    return false;
++}
++
++static bool add_pio_interface_cb(Int128 start, Int128 size,
++                                 const MemoryRegion *mr,
++                                 hwaddr offset_in_region, void *opaque)
++{
++    (void)offset_in_region;
++    (void)opaque;
++    if (!g_hash_table_lookup(fuzzable_memoryregions, mr)) {
++        return false;
++    }
++
++    add_interface(INTERFACE_TYPE_PIO, int128_get64(start), int128_get64(size),
++                  mr->name ? mr->name : "pio", access_min_size(mr),
++                  access_max_size(mr, true));
++    pio_region_count++;
++    return false;
++}
++
++static void arituzz_collect_fuzz_objects(void)
++{
++    char **result;
++
++    g_assert_nonnull(active_config);
++    result = g_strsplit(active_config->objects, " ", -1);
++    for (int i = 0; result[i] != NULL; i++) {
++        GString *name_pattern = g_string_new(result[i]);
++
++        g_string_ascii_down(name_pattern);
++        printf("Matching objects by name %s\n", result[i]);
++        object_child_foreach_recursive(qdev_get_machine(), locate_fuzz_objects,
++                                       name_pattern->str);
++        g_string_free(name_pattern, true);
++    }
++    g_strfreev(result);
++}
++
++static void arituzz_collect_interfaces(void)
++{
++    mmio_region_count = 0;
++    pio_region_count = 0;
++    flatview_for_each_range(address_space_memory.current_map,
++                            add_mmio_interface_cb, NULL);
++    flatview_for_each_range(address_space_io.current_map,
++                            add_pio_interface_cb, NULL);
++    add_interface(INTERFACE_TYPE_DMA, 0, 1, "dma", 1, 1);
++}
++
++static void arituzz_pre_fuzz(QTestState *s)
++{
++    AriTuzzRuntimeConfig runtime_config = {
++        .device_model_file = "/opt/src/projects/vmfuzz/out/device-model.json",
++        .targets_file = "/opt/src/projects/vmfuzz/out/targets.json",
++        .dictionary_file = "/opt/src/projects/vmfuzz/out/dict.txt",
++        .event_dir = "/opt/src/projects/vmfuzz/out/events",
++    };
++
++    if (arituzz_runtime_init(&runtime_config) != 0) {
++        fprintf(stderr, "failed to initialize AriTuzz runtime\n");
++        exit(1);
++    }
++    atexit(arituzz_runtime_shutdown);
++
++    qts_global = s;
++    qtest_log_enabled = false;
++    avoid_double_fetches = true;
++
++    sparse_mem_mr = sparse_mem_init(0, UINT64_MAX);
++    dma_regions = g_array_new(false, false, sizeof(AriTuzzAddressRange));
++    dma_patterns = g_array_new(false, false, sizeof(AriTuzzPattern));
++    fuzzable_memoryregions = g_hash_table_new(NULL, NULL);
++    fuzzable_pci_devices = g_ptr_array_new();
++
++    arituzz_collect_fuzz_objects();
++    arituzz_collect_interfaces();
++
++    fprintf(stderr, "This process will fuzz through the following interfaces:\n");
++    if (get_number_of_interfaces() == 0) {
++        fprintf(stderr, "No fuzzable interfaces found\n");
++    } else {
++        print_interfaces();
++    }
++}
++
++static void arituzz_map_pci_devices(QTestState *s)
++{
++    QPCIBus *pcibus;
++
++    if (g_strcmp0(TARGET_NAME, "x86_64") != 0 ||
++        fuzzable_pci_devices->len == 0) {
++        return;
++    }
++
++    pcibus = qpci_new_pc(s, NULL);
++    g_ptr_array_foreach(fuzzable_pci_devices, pci_enum, pcibus);
++    qpci_free_pc(pcibus);
++}
++
++static void arituzz_reset_dma_state(void)
++{
++    g_array_set_size(dma_patterns, 0);
++    g_array_set_size(dma_regions, 0);
++    dma_pattern_index = 0;
++    dma_bytes_written = 0;
++}
++
++static void arituzz_execute_mmio_read(QTestState *s, const MMIOReadMessage *msg)
++{
++    AriTuzzAddressRange abs;
++    size_t width = arituzz_byte_width(msg->size, false);
++
++    if (!get_mmio_address(&abs, msg->region_id, msg->addr) || abs.size < width) {
++        return;
++    }
++
++    switch (width) {
++    case 8:
++        qtest_readq(s, abs.addr);
++        break;
++    case 4:
++        qtest_readl(s, abs.addr);
++        break;
++    case 2:
++        qtest_readw(s, abs.addr);
++        break;
++    case 1:
++    default:
++        qtest_readb(s, abs.addr);
++        break;
++    }
++}
++
++static void arituzz_execute_mmio_write(QTestState *s, const MMIOWriteMessage *msg)
++{
++    AriTuzzAddressRange abs;
++    size_t width = arituzz_byte_width(msg->size, false);
++
++    if (!get_mmio_address(&abs, msg->region_id, msg->addr) || abs.size < width) {
++        return;
++    }
++
++    switch (width) {
++    case 8:
++        qtest_writeq(s, abs.addr, msg->value);
++        break;
++    case 4:
++        qtest_writel(s, abs.addr, msg->value & 0xffffffffU);
++        break;
++    case 2:
++        qtest_writew(s, abs.addr, msg->value & 0xffffU);
++        break;
++    case 1:
++    default:
++        qtest_writeb(s, abs.addr, msg->value & 0xffU);
++        break;
++    }
++}
++
++static void arituzz_execute_pio_read(QTestState *s, const PIOReadMessage *msg)
++{
++    AriTuzzAddressRange abs;
++    size_t width = arituzz_byte_width(msg->size, true);
++
++    if (!get_pio_address(&abs, msg->region_id, msg->port) || abs.size < width) {
++        return;
++    }
++
++    switch (width) {
++    case 4:
++        qtest_inl(s, abs.addr);
++        break;
++    case 2:
++        qtest_inw(s, abs.addr);
++        break;
++    case 1:
++    default:
++        qtest_inb(s, abs.addr);
++        break;
++    }
++}
++
++static void arituzz_execute_pio_write(QTestState *s, const PIOWriteMessage *msg)
++{
++    AriTuzzAddressRange abs;
++    size_t width = arituzz_byte_width(msg->size, true);
++
++    if (!get_pio_address(&abs, msg->region_id, msg->port) || abs.size < width) {
++        return;
++    }
++
++    switch (width) {
++    case 4:
++        qtest_outl(s, abs.addr, msg->value);
++        break;
++    case 2:
++        qtest_outw(s, abs.addr, msg->value & 0xffffU);
++        break;
++    case 1:
++    default:
++        qtest_outb(s, abs.addr, msg->value & 0xffU);
++        break;
++    }
++}
++
++static void arituzz_stage_dma_pattern(const DMAMessage *msg)
++{
++    AriTuzzPattern pattern;
++    const DMARandomMessage *random_message;
++
++    if (msg->dma_message_type != ARITUZZ_DMA_MESSAGE_TYPE_NORMAL &&
++        msg->dma_message_type != ARITUZZ_DMA_MESSAGE_TYPE_STRUCTURE) {
++        return;
++    }
++
++    random_message = &msg->dma_message_content.dma_random_message;
++    if (!random_message->data || random_message->len == 0) {
++        return;
++    }
++
++    pattern.index = random_message->index % random_message->len;
++    pattern.stride = random_message->stride == 0 ? 1 : random_message->stride;
++    pattern.len = random_message->len;
++    pattern.data = random_message->data;
++    g_array_append_val(dma_patterns, pattern);
++}
++
++static void arituzz_execute_message(QTestState *s, const Message *message)
++{
++    switch (message->type) {
++    case ARITUZZ_MMIO_READ:
++        arituzz_execute_mmio_read(s, &message->message_content.mmio_read_message);
++        break;
++    case ARITUZZ_MMIO_WRITE:
++        arituzz_execute_mmio_write(s, &message->message_content.mmio_write_message);
++        break;
++    case ARITUZZ_PIO_READ:
++        arituzz_execute_pio_read(s, &message->message_content.pio_read_message);
++        break;
++    case ARITUZZ_PIO_WRITE:
++        arituzz_execute_pio_write(s, &message->message_content.pio_write_message);
++        break;
++    case ARITUZZ_DMA:
++        arituzz_stage_dma_pattern(&message->message_content.dma_message);
++        break;
++    case ARITUZZ_CLOCK:
++        qtest_clock_step_next(s);
++        break;
++    default:
++        break;
++    }
++
++    flush_events(s);
++    g_array_set_size(dma_regions, 0);
++}
++
++static void arituzz_fuzz(QTestState *s, const unsigned char *Data, size_t Size)
++{
++    MessageSequence message_sequence = {};
++    size_t message_count;
++
++    arituzz_runtime_before_iteration(Size);
++    message_count = arituzz_get_message_sequence(Data, Size, &message_sequence);
++
++    arituzz_reset_dma_state();
++    arituzz_map_pci_devices(s);
++    for (size_t i = 0; i < message_count; i++) {
++        arituzz_execute_message(s, &message_sequence.messages[i]);
++    }
++
++    arituzz_cleanup_message_sequence(&message_sequence);
++    arituzz_runtime_after_iteration(message_count);
++    fuzz_reset(s);
++}
++
++static size_t arituzz_fuzz_crossover(const uint8_t *data1, size_t size1,
++                                     const uint8_t *data2, size_t size2,
++                                     uint8_t *out, size_t max_out_size,
++                                     unsigned int seed)
++{
++    return arituzz_custom_crossover(data1, size1, data2, size2, out,
++                                    max_out_size, seed);
++}
++
++static GString *arituzz_fuzz_predefined_config_cmdline(FuzzTarget *target)
++{
++    GString *cmd_line;
++    g_autofree gchar *args = NULL;
++    const generic_fuzz_config *config;
++
++    g_assert(target->opaque);
++    config = target->opaque;
++    active_config = config;
++
++    if (g_strcmp0(config->name, "e1000e") == 0) {
++        args = g_strdup("-M q35 -nodefaults -device e1000e");
++    } else if (config->argfunc) {
++        args = config->argfunc();
++    } else {
++        g_assert_nonnull(config->args);
++        args = g_strdup(config->args);
++    }
++
++    cmd_line = g_string_new(TARGET_NAME);
++    g_string_append_printf(cmd_line, " -display none -machine accel=qtest,"
++                           " -m 512M %s ", args);
++    return cmd_line;
++}
++
++size_t LLVMFuzzerCustomMutator(uint8_t *data, size_t size, size_t max_size,
++                               unsigned int seed)
++{
++    return arituzz_custom_mutator(data, size, max_size, seed);
++}
++
++static void register_arituzz_fuzz_targets(void)
++{
++    for (size_t i = 0; i < ARRAY_SIZE(predefined_configs); i++) {
++        const generic_fuzz_config *config = predefined_configs + i;
++
++        fuzz_add_target(&(FuzzTarget){
++            .name = g_strconcat("arituzz-", config->name, NULL),
++            .description = "Predefined AriTuzz config.",
++            .get_init_cmdline = arituzz_fuzz_predefined_config_cmdline,
++            .pre_fuzz = arituzz_pre_fuzz,
++            .fuzz = arituzz_fuzz,
++            .crossover = arituzz_fuzz_crossover,
++            .opaque = (void *)config,
++        });
++    }
++}
++
++fuzz_target_init(register_arituzz_fuzz_targets);
+diff --git a/tests/qtest/arituzz/arituzz_qtest.h b/tests/qtest/arituzz/arituzz_qtest.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b7f49cf337a8aedd9920ffd6c03ec54b267cb60
+--- /dev/null
++++ b/tests/qtest/arituzz/arituzz_qtest.h
+@@ -0,0 +1,20 @@
++#ifndef QTEST_ARITUZZ_QTEST_H
++#define QTEST_ARITUZZ_QTEST_H
++
++#include "qemu/osdep.h"
++
++#include "tests/qtest/libqtest.h"
++
++typedef struct AriTuzzAddressRange {
++    uint64_t addr;
++    uint64_t size;
++} AriTuzzAddressRange;
++
++typedef struct AriTuzzPattern {
++    uint8_t index;
++    uint8_t stride;
++    size_t len;
++    const uint8_t *data;
++} AriTuzzPattern;
++
++#endif /* QTEST_ARITUZZ_QTEST_H */
